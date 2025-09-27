@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Envs
+animalab/
+.venv/
+venv/
+env/
+
+# Editors / IDE
+.vscode/
+.idea/
+
+# Weights & logs
+wandb/
+logs/
+checkpoints/
+
+# Logs / runs
+wandb/
+logs/
+checkpoints/
+
+# Data (adjust to your structure)
+temp_ac_ks/*.pt
+data/
+*.h5
+
+# OS
+.DS_Store
+Thumbs.db
