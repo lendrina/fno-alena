@@ -135,7 +135,7 @@ class KSStepDatasetFromTensor(Dataset):
     def __len__(self):  return self.X.shape[0]
     def __getitem__(self, i):  return {"x": self.X[i], "y": self.Y[i]}
 
-# Your KS file that matches the paper’s regime: ν=0.01, L=6π, dtsave=0.1
+# Load the KS dataset
 ks_path = r"C:/Users/elena/Anima's lab/temp_ac_ks/T=100,niu=0.01,N=1024,dt=0.001,6pi,dtsave=0.1,sample=200(68)._test_ut.pt"
 U = torch.load(ks_path, map_location="cpu").float()    # (N, T, 1024)
 
@@ -159,7 +159,6 @@ train_loader = DataLoader(train_dataset, batch_size=config["data"]["batch_size"]
 test_loaders = {"ks_test": DataLoader(test_dataset, batch_size=config["data"]["batch_size"],
                                       shuffle=False, num_workers=0, pin_memory=True)}
 
-# Since our dataset is already numerical tensors, no processor is required
 class IdentityProcessor(nn.Module):
     def __init__(self):
         super().__init__()
