@@ -9,7 +9,8 @@ import math
 from typing import List
 
 import torch
-
+import torch.nn as nn
+import torch.nn.functional as F
 from .differentiation import central_diff_1d, central_diff_2d, central_diff_3d, FiniteDiff
 
 #loss function with rel/abs Lp loss
@@ -774,3 +775,27 @@ class MSELoss(object):
         if dim is None:
             dim = list(range(1, y_pred.ndim)) # no reduction across batch dim
         return torch.mean((y_pred - y) ** 2, dim=dim).sum() # sum of MSEs for each element
+
+class ScaleConsistencyLoss(nn.Module):
+    """
+    Enforces that model predictions are consistent across scales.
+    See: https://github.com/neuraloperator/neuraloperator
+    """
+    def __init__(self, base_loss, scales=[2, 4], weight=0.1):
+        super().__init__()
+        self.base_loss = base_loss
+        self.scales = scales
+        self.weight = weight
+
+    def forward(self, pred, y=None, **kwargs):
+        # `y` is the target, extra keys are ignored
+        loss = self.base_loss(pred, y)
+
+        for s in self.scales:
+            if pred.shape[-1] % s != 0:
+                continue
+            pred_ds = F.avg_pool1d(pred, kernel_size=s, stride=s)
+            y_ds    = F.avg_pool1d(y, kernel_size=s, stride=s)
+            loss += self.weight * self.base_loss(pred_ds, y_ds)
+
+        return loss

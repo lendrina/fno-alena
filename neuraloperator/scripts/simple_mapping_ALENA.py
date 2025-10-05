@@ -3,6 +3,7 @@ import sys
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler, Dataset, Subset
 import wandb
 import matplotlib.pyplot as plt
@@ -33,12 +34,12 @@ if config["wandb"]["project"] is None:
 if config["wandb"]["entity"] is None:
     config["wandb"]["entity"] = "lendrina24" 
 
-config["model"]["data_channels"]   = 1
+config["model"]["data_channels"]   = 2
 config["model"]["out_channels"]    = 1
-config["model"]["n_modes"]         = [32]   # 1D: number of Fourier modes
-config["model"]["hidden_channels"] = 64
+config["model"]["n_modes"]         = [16]   # 1D: number of Fourier modes
+config["model"]["hidden_channels"] = 48
 config["model"]["n_layers"]        = 6
-config["data"]["batch_size"]       = 32
+config["data"]["batch_size"]       = 64
 config["opt"]["training_loss"]     = "l2"   # fit-the-data stage uses L2
 config["opt"]["learning_rate"]     = 1e-3
 config["opt"]["scheduler"]         = "CosineAnnealingLR"
@@ -47,7 +48,12 @@ config["opt"]["scheduler_T_max"]   = config["opt"]["n_epochs"]
 device, is_logger = setup(config)
 assert torch.cuda.is_available(), "CUDA not available — install GPU PyTorch or switch runtime"
 device = torch.device("cuda:0")
-torch.backends.cudnn.benchmark = True  # speed-up for fixed input shapes
+
+# speed-ups on recent NVIDIA GPUs
+torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.matmul.allow_tf32 = True
+config["opt"]["mixed_precision"] = True
 
 def log_predictions_to_wandb(model, loader, device, n_samples=3):
     model.eval()
@@ -102,35 +108,34 @@ if config.verbose and is_logger:
     print(config)
     sys.stdout.flush()
 
-class KSStepDatasetFromTensor(Dataset):
-    def __init__(self, U: torch.Tensor, dtsave: float, target_delta: float = 0.1, start_to_use: float = 0.0, t_use: float = 0.1, drop_last_frames: int = 2):
-        U = U.float()
-        assert U.ndim in (3, 4), f"Expected (N,T,X) or (N,T,H,W), got {tuple(U.shape)}"
-        N, T, *spatial = U.shape
+class KSTimeCondDataset(Dataset):
+    def __init__(self, U: torch.Tensor, dtsave: float = 0.1, start_to_use: float = 0.0, drop_last_frames: int = 2):
+        U = U.float()                   # (N, T, X)
+        assert U.ndim == 3
+        N, T, X = U.shape
 
-        # indices (all in time steps)
-        start_idx   = int(round(start_to_use / dtsave))
-        stride_steps = max(1, int(round(t_use / dtsave)))
-        n_ahead     = int(round(target_delta / dtsave))
+        # usable time indices (skip last two zeros)
+        start_idx = int(round(start_to_use / dtsave))
+        last_t_idx = T - drop_last_frames            # exclusive target limit
+        if last_t_idx <= start_idx + 1:
+            raise ValueError("Not enough usable time steps.")
 
-        last_target = T - 1 - drop_last_frames         # last allowed target index
-        last_input  = last_target - n_ahead             # last allowed input index
-        if last_input < start_idx:
-            raise ValueError("Not enough usable time steps after dropping last frames.")
+        # times (seconds) and a [0,1] normalization for the t-channel
+        t_idx   = torch.arange(start_idx, last_t_idx)    # k
+        t_vals  = t_idx * dtsave                         # k * dt
+        t_max   = (last_t_idx - 1) * dtsave
+        t_norm  = (t_vals / (t_max + 1e-8)).clamp(0, 1)  # [0,1]
 
-        idxs = torch.arange(start_idx, last_input + 1, stride_steps)  # k, k+stride, ...
-        # Gather pairs
-        x = U[:, idxs, ...]               # (N, K, spatial...)
-        y = U[:, idxs + n_ahead, ...]     # (N, K, spatial...)
+        # build inputs for every (traj, time)
+        u0       = U[:, 0, :]                            # (N, X)
+        u0_rep   = u0[:, None, :].repeat(1, len(t_idx), 1)   # (N, K, X)
+        t_chan   = t_norm[None, :, None].repeat(N, 1, X)     # (N, K, X)
 
-        # flatten (N, K, ...) -> (N*K, ...)
-        B = x.shape[0] * x.shape[1]
-        x = x.reshape(B, *spatial)
-        y = y.reshape(B, *spatial)
+        x = torch.stack([u0_rep, t_chan], dim=2)         # (N, K, 2, X)
+        y = U[:, t_idx, :][:, :, None, :]                # (N, K, 1, X)
 
-        # add channel dim
-        self.X = x.unsqueeze(1).contiguous()   # (B, 1, X) or (B, 1, H, W)
-        self.Y = y.unsqueeze(1).contiguous()
+        self.X = x.reshape(-1, 2, X).contiguous()        # (B, 2, X)
+        self.Y = y.reshape(-1, 1, X).contiguous()        # (B, 1, X)
 
     def __len__(self):  return self.X.shape[0]
     def __getitem__(self, i):  return {"x": self.X[i], "y": self.Y[i]}
@@ -141,18 +146,17 @@ U = torch.load(ks_path, map_location="cpu").float()    # (N, T, 1024)
 
 # Split by trajectories so train & test share the same ν/L/dtsave (no mismatch)
 N = U.shape[0]
-g = torch.Generator().manual_seed(0)
-perm = torch.randperm(N, generator=g)
+perm = torch.randperm(N)
 n_train_traj = int(0.8 * N)
 U_train = U[perm[:n_train_traj]]
 U_test  = U[perm[n_train_traj:]]
 
 # Build S(0.1) pairs (exact since dtsave=0.1 here)
-train_dataset = KSStepDatasetFromTensor(U_train, dtsave=0.1, target_delta=0.1, start_to_use=0.0, t_use=0.1, drop_last_frames=2)
-test_dataset  = KSStepDatasetFromTensor(U_test,  dtsave=0.1, target_delta=0.1, start_to_use=0.0, t_use=0.1, drop_last_frames=2)
+train_dataset = KSTimeCondDataset(U_train, dtsave=0.1, start_to_use=0.0, drop_last_frames=2)
+test_dataset  = KSTimeCondDataset(U_test,  dtsave=0.1, start_to_use=0.0, drop_last_frames=2)
 
-# train_dataset = Subset(train_dataset, range(min(20000, len(train_dataset))))
-# test_dataset  = Subset(test_dataset,  range(min(20000, len(test_dataset))))
+#train_dataset = Subset(train_dataset, range(min(20000, len(train_dataset))))
+#test_dataset  = Subset(test_dataset,  range(min(20000, len(test_dataset))))
 
 train_loader = DataLoader(train_dataset, batch_size=config["data"]["batch_size"],
                           shuffle=True, drop_last=True, num_workers=0, pin_memory=True)
@@ -234,19 +238,52 @@ elif config.opt.scheduler == "StepLR":
 else:
     raise ValueError(f"Got scheduler={config.opt.scheduler}")
 
+#Scale-consistent loss
+class ScaleConsistentL2(nn.Module):
+    def __init__(self, base_loss: nn.Module, model: nn.Module,
+                 scales=(2, 4), lambda_sc=0.1):
+        super().__init__()
+        self.base_loss = base_loss
+        self.model = model
+        self.scales = list(scales)
+        self.lambda_sc = float(lambda_sc)
 
+    @staticmethod
+    def _down1d(z, s: int):
+        # z: (B, 1, X). Average-pool with stride s (assumes X % s == 0)
+        return F.avg_pool1d(z, kernel_size=s, stride=s, ceil_mode=False)
+
+    def forward(self, out, y=None, x=None, **kwargs):
+        # base (supervised) loss first
+        base = self.base_loss(out, y)  # NOTE: LpLoss/H1Loss from neuralop accept (out, y)
+
+        # scale-consistency on each factor
+        sc = out.new_tensor(0.0)
+        for s in self.scales:
+            # coarse input and outputs
+            x_c    = self._down1d(x,   s)       # (B, 1, X/s)
+            out_f  = self._down1d(out, s)       # (B, 1, X/s)
+            # forward at coarse scale
+            y_cpred = self.model(x_c)           # (B, 1, X/s)
+            sc = sc + F.mse_loss(y_cpred, out_f, reduction="sum")
+
+        return base + self.lambda_sc * sc
+    
 # Creating the losses
 l2loss = LpLoss(d=1, p=2)
 h1loss = H1Loss(d=1)
-if config.opt.training_loss == "l2":
-    train_loss = l2loss
-elif config.opt.training_loss == "h1":
-    train_loss = h1loss
-else:
-    raise ValueError(
-        f'Got training_loss={config.opt.training_loss} '
-        f'but expected one of ["l2", "h1"]'
-    )
+# if config.opt.training_loss == "l2":
+#     train_loss = l2loss
+# elif config.opt.training_loss == "h1":
+#     train_loss = h1loss
+# else:
+#     raise ValueError(
+#         f'Got training_loss={config.opt.training_loss} '
+#         f'but expected one of ["l2", "h1"]'
+#     )
+# eval_losses = {"h1": h1loss, "l2": l2loss}
+base_loss = l2loss if config.opt.training_loss == "l2" else h1loss
+train_loss = ScaleConsistentL2(base_loss, model, scales=(4, 8), lambda_sc=0.1)
 eval_losses = {"h1": h1loss, "l2": l2loss}
 
 if config.verbose and is_logger:
