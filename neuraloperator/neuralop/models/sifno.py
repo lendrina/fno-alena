@@ -14,7 +14,6 @@ class SIFNO1d(nn.Module):
                                       n_params=n_params)
             for _ in range(n_layers)
         ])
-        self.act = nn.GELU()
         self.project_out = nn.Sequential(
             nn.Conv1d(width, width, 1), nn.GELU(),
             nn.Conv1d(width, out_channels, 1)

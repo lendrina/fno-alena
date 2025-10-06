@@ -45,7 +45,7 @@ config["model"]["hidden_channels"] = 128
 config["model"]["n_layers"]        = 6
 config["data"]["batch_size"]       = 64
 config["opt"]["training_loss"]     = "l2"
-config["opt"]["learning_rate"]     = 1e-3
+config["opt"]["learning_rate"]     = 3e-4
 config["opt"]["scheduler"]         = "CosineAnnealingLR"
 config["opt"]["scheduler_T_max"]   = config["opt"]["n_epochs"]
 config["opt"]["mixed_precision"] = False
@@ -59,27 +59,26 @@ torch.backends.cuda.matmul.allow_tf32 = True
 #Dataset Wrapper for KS data with time as a scalar input
 class KSTimeCondDataset(Dataset):
     def __init__(self, U: torch.Tensor, dtsave: float = 0.1, drop_last_frames: int = 2):
-        # U: [N_traj, T, X], last two frames are zeros (don’t use them)
         U = U.float()
         N, T, X = U.shape
 
         last_t_idx = T - drop_last_frames
-        t_idx  = torch.arange(last_t_idx)                     # 0..last_t_idx-1
-        t_vals = t_idx * dtsave                               # physical times
-        t_max  = (last_t_idx - 1) * dtsave
-        t_norm = (t_vals / (t_max + 1e-8)).clamp(0, 1)        # normalize to [0,1]
+        t_idx = torch.arange(last_t_idx)
+        t_vals = t_idx * dtsave
+        t_max = (last_t_idx - 1) * dtsave
+        t_norm = (t_vals / (t_max + 1e-8)).clamp(0, 1)
 
-        u0     = U[:, 0, :]                                   # [N, X]
-        u0_rep = u0[:, None, :].repeat(1, last_t_idx, 1)      # [N, K, X]
-        t_rep  = t_norm[None, :, None].repeat(N, 1, 1)        # [N, K, 1]
+        u0 = U[:, 0, :]
+        u0_rep = u0[:, None, :].repeat(1, last_t_idx, 1)
+        t_rep = t_norm[None, :, None].repeat(N, 1, 1)
 
-        self.inputs  = u0_rep.reshape(-1, 1, X).contiguous()  # [B, 1, X]
-        self.params  = t_rep.reshape(-1, 1).contiguous()      # [B, 1]
-        self.targets = U[:, :last_t_idx, :].reshape(-1, 1, X).contiguous()  # [B, 1, X]
+        self.inputs = u0_rep.reshape(-1, 1, X).contiguous()
+        self.params = t_rep.reshape(-1, 1).contiguous()
+        self.targets = U[:, :last_t_idx, :].reshape(-1, 1, X).contiguous()
 
         # helpful for debugging
         self.last_t_idx = last_t_idx
-        self.t_norm     = t_norm
+        self.t_norm = t_norm
 
     def __len__(self):
         return self.inputs.shape[0]
@@ -141,14 +140,19 @@ if config.verbose and is_logger:
 
 #data
 ks_path = Path("C:/Users/elena/Anima's lab/temp_ac_ks/T=100,niu=0.01,N=1024,dt=0.001,6pi,dtsave=0.1,sample=200(68)._test_ut.pt")
-U = torch.load(ks_path, map_location="cpu").float()    # (N, T, X)
+ac_path = Path("C:/Users/elena/Anima's lab/temp_ac_ks/T=3000_niu=0.005_N=1024_dt=0.00625_2pi_dtsave=0.125_sample=40.pt")
+U = torch.load(ac_path, map_location="cpu").float()    # (N, T, X)
 N = U.shape[0]
 perm = torch.randperm(N)
 n_train_traj = int(0.8 * N)
 U_train = U[perm[:n_train_traj]]
 U_test  = U[perm[n_train_traj:]]
-train_dataset = KSTimeCondDataset(U_train, dtsave=0.1)
-test_dataset  = KSTimeCondDataset(U_test,  dtsave=0.1)
+ac_dtsave = 0.125
+ks_dtsave = 0.1
+ac_frames = 0
+ks_frames = 2
+train_dataset = KSTimeCondDataset(U_train, dtsave=ac_dtsave, drop_last_frames=ac_frames)
+test_dataset  = KSTimeCondDataset(U_test,  dtsave=ac_dtsave, drop_last_frames=ac_frames)
 
 with torch.no_grad():
     x_mean = train_dataset.inputs.mean(dim=(0, 2), keepdim=True)
@@ -219,29 +223,6 @@ print("params range:", train_dataset.params.min().item(), "->",
 batch = next(iter(train_loader))
 small_dataset = Subset(train_dataset, range(128))
 small_loader = DataLoader(small_dataset, batch_size=32, shuffle=True)
-
-model.eval()
-with torch.no_grad():
-    dbg_iter = iter(train_loader)
-    batch = next(dbg_iter)
-
-    x_inputs = batch["x_inputs"].to(device)
-    x_params = batch["x_params"].to(device)
-    y_true   = batch["y"].to(device)
-
-    y_pred = model(x_inputs=x_inputs, x_params=x_params)
-
-    print("SANITY CHECK")
-    print("  x_inputs:", x_inputs.shape, "  x_params:", x_params[:8].flatten().tolist())
-    print("  y_true  (first 10):", y_true[0, 0, :10].detach().cpu().numpy())
-    print("  y_pred  (first 10):", y_pred[0, 0, :10].detach().cpu().numpy())
-
-    # (optional) also show de-normalized values if you normalized targets
-    ym, ys = train_dataset.norm_stats["y_mean"].to(device), train_dataset.norm_stats["y_std"].to(device)
-    y_true_denorm = y_true * ys + ym
-    y_pred_denorm = y_pred * ys + ym
-    print("  y_true denorm (10):", y_true_denorm[0, 0, :10].detach().cpu().numpy())
-    print("  y_pred denorm (10):", y_pred_denorm[0, 0, :10].detach().cpu().numpy())
     
 trainer = Trainer(
     model=model,
@@ -260,19 +241,6 @@ if is_logger:
     print(f"n_params: {n_params}")
     wandb.log({"n_params": n_params})
     wandb.watch(model)
-
-
-train_iter = iter(train_loader)
-for i in range(3):
-    batch = next(train_iter)
-    x_inputs = batch["x_inputs"]
-    x_params = batch["x_params"]   # this should be your time scalar
-    y = batch["y"]
-
-    print(f"Batch {i}:")
-    print("  x_inputs shape:", x_inputs.shape)
-    print("  x_params:", x_params[:5].squeeze().tolist())  # first few times
-    print("  y shape:", y.shape)
 
 trainer.train(
     train_loader=train_loader,
