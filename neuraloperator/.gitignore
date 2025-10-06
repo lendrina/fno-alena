@@ -43,6 +43,12 @@ var/
 *.egg
 .pytest_cache/
 
+# keep source/data folders even if broader ignore rules match
+!neuralop/
+!neuralop/**
+!neuralop/data/
+!neuralop/data/**
+
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
