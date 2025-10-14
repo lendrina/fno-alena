@@ -398,8 +398,8 @@ class ScaleInformedSpectralConv(BaseSpectralConv):
             # The last mode already has redundant half removed in real FFT
             slices_w += [slice(start//2, -start//2) if start else slice(start, None) for start in starts[:-1]]
             slices_w += [slice(None, -starts[-1]) if starts[-1] else slice(None)]
-        
-        weight = self.weight[slices_w]
+
+        weight = self.weight[tuple(slices_w)]
 
         ### Pick the first n_modes modes of FFT signal along each dim
 
@@ -429,12 +429,18 @@ class ScaleInformedSpectralConv(BaseSpectralConv):
         else:
             slices_x[-1] = slice(None)
 
-        #NEW: apply scalar gating before contraction
-        gate = self.param_emb(params)   # [B, Cin]
-        gate = gate[..., None]          # [B, Cin, 1]
-        x_mod = x[slices_x] * gate      # should broadcast correctly
+        x_sel = x[tuple(slices_x)]
 
-        out_fft[slices_x] = self._contract(x_mod, weight, separable=self.separable)
+        #NEW: apply scalar gating before contraction
+        gate = self.param_emb(params)                 # [B, Cg]
+        
+        for _ in range(self.order):
+            gate = gate.unsqueeze(-1)
+            
+        x_sel = x[tuple(slices_x)]
+        x_mod = x_sel * gate
+
+        out_fft[tuple(slices_x)] = self._contract(x_mod, weight, separable=self.separable)
 
         if self.resolution_scaling_factor is not None and output_shape is None:
             mode_sizes = tuple([round(s * r) for (s, r) in zip(mode_sizes, self.resolution_scaling_factor)])

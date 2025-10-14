@@ -27,8 +27,8 @@ config = make_config_from_cli(Default)
 config = config.to_dict()
 
 device, is_logger = setup(config)
-assert torch.cuda.is_available()
-device = torch.device("cuda:0")
+# assert torch.cuda.is_available()
+# device = torch.device("cuda:0")
 
 # Force-enable wandb logging
 config["wandb"]["log_output"] = False
@@ -56,39 +56,82 @@ torch.backends.cudnn.allow_tf32 = True
 torch.backends.cuda.matmul.allow_tf32 = True
 
 
-#Dataset Wrapper for KS data with time as a scalar input
-class KSTimeCondDataset(Dataset):
-    def __init__(self, U: torch.Tensor, dtsave: float = 0.1, drop_last_frames: int = 2):
-        U = U.float()
-        N, T, X = U.shape
+class TimeShiftSemigroupDataset(Dataset):
+    def __init__(self, U, dtsave,
+                 min_h_frames=1, max_h_frames=None,
+                 drop_tail_frames=0, n_params=1,
+                 norm_stats=None, apply_norm=False):
+        super().__init__()
+        assert U.ndim >= 3, "U must be [N, T, *S]"
+        self.U = U.float()
+        self.N, self.T = U.shape[:2]
+        # Detect true spatial shape (ignore leading singleton dims)
+        self.S = tuple(s for s in U.shape[2:] if s > 1)
+        self.D = len(self.S)
+        self.dtsave = float(dtsave)
+        self.drop_tail = int(drop_tail_frames)
+        self.valid_T = self.T - self.drop_tail
+        self.n_params = int(n_params)
 
-        last_t_idx = T - drop_last_frames
-        t_idx = torch.arange(last_t_idx)
-        t_vals = t_idx * dtsave
-        t_max = (last_t_idx - 1) * dtsave
-        t_norm = (t_vals / (t_max + 1e-8)).clamp(0, 1)
+        self.min_h = max(1, int(min_h_frames))
+        self.max_h = self.valid_T - 1 if max_h_frames is None else int(max_h_frames)
+        self.max_h = max(self.min_h, self.max_h)
 
-        u0 = U[:, 0, :]
-        u0_rep = u0[:, None, :].repeat(1, last_t_idx, 1)
-        t_rep = t_norm[None, :, None].repeat(N, 1, 1)
+        self.index = [(n, k) for n in range(self.N)
+                              for k in range(self.valid_T - self.min_h)]
 
-        self.inputs = u0_rep.reshape(-1, 1, X).contiguous()
-        self.params = t_rep.reshape(-1, 1).contiguous()
-        self.targets = U[:, :last_t_idx, :].reshape(-1, 1, X).contiguous()
-
-        # helpful for debugging
-        self.last_t_idx = last_t_idx
-        self.t_norm = t_norm
+        self.apply_norm = bool(apply_norm)
+        if norm_stats is None:
+            self.x_mean = self.x_std = self.y_mean = self.y_std = None
+        else:
+            self.x_mean = norm_stats["x_mean"]
+            self.x_std  = norm_stats["x_std"]
+            self.y_mean = norm_stats["y_mean"]
+            self.y_std  = norm_stats["y_std"]
 
     def __len__(self):
-        return self.inputs.shape[0]
+        return len(self.index)
 
-    def __getitem__(self, i):
-        return {
-            "x_inputs": self.inputs[i],   # [1, X]
-            "x_params": self.params[i],   # [1]   (scalar time, normalized)
-            "y":        self.targets[i],  # [1, X]
-        }
+    def _sample_delta(self):
+        return torch.randint(self.min_h, self.max_h + 1, (1,), dtype=torch.long).item()
+
+    def __getitem__(self, idx):
+        n, k = self.index[idx]
+        Δ = self._sample_delta()
+        k2 = min(k + Δ, self.valid_T - 1)
+
+        u_raw = self.U[n, k]
+        y_raw = self.U[n, k2]
+        u_sp = u_raw.squeeze()
+        y_sp = y_raw.squeeze()
+
+        if y_sp.ndim != u_sp.ndim:
+            while y_sp.ndim < u_sp.ndim:
+                y_sp = y_sp.unsqueeze(0)
+            while u_sp.ndim < y_sp.ndim:
+                u_sp = u_sp.unsqueeze(0)
+
+        u = u_sp.reshape(self.S).unsqueeze(0)  # [1, *S]
+        y = y_sp.reshape(self.S).unsqueeze(0)  # [1, *S]
+
+        if self.apply_norm and (self.x_mean is not None):
+            eps = 1e-6
+            u = (u - self.x_mean) / self.x_std.clamp_min(eps)
+            y = (y - self.y_mean) / self.y_std.clamp_min(eps)
+
+        h = float(Δ) * self.dtsave
+        params = torch.zeros(self.n_params, dtype=u.dtype)
+        params[0] = h
+
+        return {"x_inputs": u, "x_params": params, "y": y}
+
+def compute_norm_stats(U_train):
+    # U_train: [N, T, *S]
+    m = U_train.mean(dim=(0, 1))                     # [*S]
+    s = U_train.std(dim=(0, 1)).clamp_min(1e-6)      # [*S]
+    m = m.unsqueeze(0)                                # [1, *S]
+    s = s.unsqueeze(0)                                # [1, *S]
+    return {"x_mean": m, "x_std": s, "y_mean": m, "y_std": s}
 
 # Logging predictions (same style as before)
 def log_predictions_to_wandb(model, loader, device, n_samples=3):
@@ -139,9 +182,9 @@ if config.verbose and is_logger:
     sys.stdout.flush()
 
 #data
-ks_path = Path("C:/Users/elena/Anima's lab/temp_ac_ks/T=100,niu=0.01,N=1024,dt=0.001,6pi,dtsave=0.1,sample=200(68)._test_ut.pt")
-ac_path = Path("C:/Users/elena/Anima's lab/temp_ac_ks/T=3000_niu=0.005_N=1024_dt=0.00625_2pi_dtsave=0.125_sample=40.pt")
-U = torch.load(ac_path, map_location="cpu").float()    # (N, T, X)
+ks_path = Path("C:/Users/elena/fno-alena/temp_ac_ks/T=100,niu=0.01,N=1024,dt=0.001,6pi,dtsave=0.1,sample=200(68)._test_ut.pt")
+ac_path = Path("C:/Users/elena/fno-alena/temp_ac_ks/T=3000_niu=0.005_N=1024_dt=0.00625_2pi_dtsave=0.125_sample=40.pt")
+U = torch.load(ac_path, map_location="cpu").float()
 N = U.shape[0]
 perm = torch.randperm(N)
 n_train_traj = int(0.8 * N)
@@ -151,47 +194,38 @@ ac_dtsave = 0.125
 ks_dtsave = 0.1
 ac_frames = 0
 ks_frames = 2
-train_dataset = KSTimeCondDataset(U_train, dtsave=ac_dtsave, drop_last_frames=ac_frames)
-test_dataset  = KSTimeCondDataset(U_test,  dtsave=ac_dtsave, drop_last_frames=ac_frames)
-
-with torch.no_grad():
-    x_mean = train_dataset.inputs.mean(dim=(0, 2), keepdim=True)
-    x_std  = train_dataset.inputs.std(dim=(0, 2), keepdim=True).clamp_min(1e-6)
-
-    y_mean = train_dataset.targets.mean(dim=(0, 2), keepdim=True)
-    y_std  = train_dataset.targets.std(dim=(0, 2), keepdim=True).clamp_min(1e-6)
-
-    # normalize in-place (train)
-    train_dataset.inputs  = (train_dataset.inputs  - x_mean) / x_std
-    train_dataset.targets = (train_dataset.targets - y_mean) / y_std
-
-    # normalize test using *train* stats
-    test_dataset.inputs   = (test_dataset.inputs  - x_mean) / x_std
-    test_dataset.targets  = (test_dataset.targets - y_mean) / y_std
-
-# Keep stats for inverse-transform / logging later
-train_dataset.norm_stats = {
-    "x_mean": x_mean, "x_std": x_std,
-    "y_mean": y_mean, "y_std": y_std,
-}
+n_params = 1  # or >1 if you want vector params later
+norm_stats = compute_norm_stats(U_train)
+train_dataset = TimeShiftSemigroupDataset(
+    U_train, dtsave=ac_dtsave, min_h_frames=1, max_h_frames=None,
+    drop_tail_frames=0, n_params=n_params, norm_stats=norm_stats, apply_norm=True
+)
+test_dataset  = TimeShiftSemigroupDataset(
+    U_test,  dtsave=ac_dtsave, min_h_frames=1, max_h_frames=None,
+    drop_tail_frames=0, n_params=n_params, norm_stats=norm_stats, apply_norm=True
+)
 
 train_loader = DataLoader(train_dataset, batch_size=config["data"]["batch_size"], shuffle=True)
 test_loader  = DataLoader(test_dataset,  batch_size=config["data"]["batch_size"], shuffle=False)
 
 test_loaders = {"ks_test": test_loader}
 batch = next(iter(train_loader))
-
+b0 = next(iter(train_loader))
+spatial = tuple(b0["x_inputs"].shape[2:])
 
 #MODEL
 model = WrappedSIFNO(
     in_channels=1,
     out_channels=1,
-    width=config["model"]["hidden_channels"],  # currently 48
-    n_layers=config["model"]["n_layers"],
-    n_modes=config["model"]["n_modes"][0],
-    emb_channels=config["model"]["hidden_channels"],  # match width
-    n_params=1
+    width=128,
+    n_layers=6,
+    n_modes=64,
+    emb_channels=128,
+    n_params=n_params
 ).to(device)
+
+model.sifno._build(spatial)
+model = model.to(device)
 
 optimizer = AdamW(
     model.parameters(),
@@ -201,6 +235,11 @@ optimizer = AdamW(
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
     optimizer, T_max=config["opt"]["scheduler_T_max"]
 )
+
+b = next(iter(train_loader))
+print("x_inputs", b["x_inputs"].shape)
+print("x_params", b["x_params"].shape)
+print("y",       b["y"].shape)
 
 # l2loss = LpLoss(d=1, p=2, reduction='sum')
 
@@ -215,14 +254,8 @@ h1loss = H1Loss(d=1, reduction='sum')
 def abs_l2(pred, y):
     return l2loss.abs(pred, y)
 
-train_loss = MSELoss()                 # absolute MSE
-eval_losses = {"mse": MSELoss()}       # report absolute MSE
-
-print("params range:", train_dataset.params.min().item(), "->",
-      train_dataset.params.max().item())
-batch = next(iter(train_loader))
-small_dataset = Subset(train_dataset, range(128))
-small_loader = DataLoader(small_dataset, batch_size=32, shuffle=True)
+train_loss = MSELoss() #absolute MSE
+eval_losses = {"mse": MSELoss()}
     
 trainer = Trainer(
     model=model,
